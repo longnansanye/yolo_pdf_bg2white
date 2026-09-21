@@ -1,0 +1,27 @@
+path: /new/test/yolo_pdf_bg2white/YOLODataset
+train: images/train
+val: images/val
+
+nc: 21
+names:
+  0: chat_avatar_left
+  1: chat_avatar_right
+  2: chat_bubble_left
+  3: chat_bubble_right
+  4: chat_timestamp
+  5: chat_voice_left
+  6: chat_voice_right
+  7: chat_image_left
+  8: chat_image_right
+  9: chat_file_left
+  10: chat_file_right
+  11: chat_input_bar
+  12: chat_name
+  13: profile_avatar
+  14: profile_nickname
+  15: profile_moments
+  16: profile_message
+  17: file_item
+  18: phone_status_bar
+  19: normal_photo
+  20: file_path_bar
