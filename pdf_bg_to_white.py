@@ -29,12 +29,14 @@ AVATAR_DETECTION_CLASSES = frozenset(
     {"profile_avatar", "chat_avatar_left", "chat_avatar_right"}
 )
 FILE_BROWSE_DETECTION_CLASSES = frozenset({"file_item", "file_path_bar"})
+CHAT_BUBBLE_CLASSES = frozenset({"chat_bubble_left", "chat_bubble_right"})
+CHAT_VOICE_CLASSES = frozenset({"chat_voice_left", "chat_voice_right"})
+# Only image messages are eligible for byte-for-byte preservation. Voice
+# detections go through the neutral-bubble recolor path after visual recheck.
 CHAT_MEDIA_CLASSES = frozenset(
     {
         "chat_image_left",
         "chat_image_right",
-        "chat_voice_left",
-        "chat_voice_right",
     }
 )
 
@@ -1184,10 +1186,92 @@ def _find_chat_green_bubbles(rgb_u8: np.ndarray) -> np.ndarray:
     return out
 
 
+def _find_chat_voice_bubbles(
+    rgb_u8: np.ndarray,
+    detections: list[Detection] | None,
+) -> np.ndarray:
+    """Return YOLO voice boxes that pass a lightweight waveform recheck."""
+    # ponytail: keep this OpenCV shape check local until the detector is retrained
+    # with enough hard-negative text bubbles to separate voice and text classes.
+    h, w = rgb_u8.shape[:2]
+    out = np.zeros((h, w), dtype=bool)
+    if not detections:
+        return out
+
+    rgb = rgb_u8.astype(np.float32)
+    lum = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+    chroma = rgb.max(2) - rgb.min(2)
+
+    for detection in detections:
+        if detection.name not in CHAT_VOICE_CLASSES:
+            continue
+        x0, y0, x1, y1 = detection.box
+        left = max(0, int(math.floor(x0)))
+        top = max(int(0.105 * h), int(math.floor(y0)))
+        right = min(w, int(math.ceil(x1)))
+        bottom = min(int(0.90 * h), int(math.ceil(y1)))
+        if right - left < 70 or bottom - top < 55:
+            continue
+
+        roi_lum = lum[top:bottom, left:right]
+        roi_chroma = chroma[top:bottom, left:right]
+        local_bg = float(np.median(roi_lum))
+        bright_ink = (roi_lum > max(70.0, local_bg + 35.0)) & (roi_chroma < 65.0)
+        if detection.name.endswith("_right"):
+            bright_ink = bright_ink[:, ::-1]
+
+        # WeChat's voice glyph is three nested, narrow arcs. Text glyphs tend
+        # to be wider and do not grow monotonically from left to right.
+        ink_u8 = bright_ink.astype(np.uint8) * 255
+        n, _labels, stats, _ = cv2.connectedComponentsWithStats(ink_u8)
+        roi_h, roi_w = bright_ink.shape
+        wave_components: list[tuple[int, int, int, int, int]] = []
+        max_component_width = max(16, int(round(0.065 * roi_w)))
+        x_min, x_max = 0.10 * roi_w, 0.36 * roi_w
+        for component_x, component_y, component_w, component_h, area in stats[1:]:
+            if area < 35 or component_w > max_component_width:
+                continue
+            if component_h < max(8, int(round(0.08 * roi_h))):
+                continue
+            if not x_min <= component_x < x_max:
+                continue
+            wave_components.append(
+                (component_x, component_y, component_w, component_h, area)
+            )
+        wave_components.sort(key=lambda component: component[0])
+
+        verified = False
+        for first, second, third in zip(
+            wave_components,
+            wave_components[1:],
+            wave_components[2:],
+        ):
+            heights = (first[3], second[3], third[3])
+            centers = (
+                first[1] + first[3] / 2.0,
+                second[1] + second[3] / 2.0,
+                third[1] + third[3] / 2.0,
+            )
+            gaps = (second[0] - first[0], third[0] - second[0])
+            if (
+                heights[1] >= 0.75 * heights[0]
+                and heights[2] >= 0.75 * heights[1]
+                and heights[2] - heights[0] >= 0.15 * roi_h
+                and max(centers) - min(centers) <= 0.25 * roi_h
+                and max(gaps) <= 0.10 * roi_w
+            ):
+                verified = True
+                break
+        if verified:
+            out[top:bottom, left:right] = True
+    return out
+
+
 def _find_chat_bubbles(
     rgb_u8: np.ndarray,
     avatar: np.ndarray,
     green: np.ndarray,
+    detections: list[Detection] | None = None,
 ) -> np.ndarray:
     """Find neutral incoming bubbles without absorbing the dark canvas."""
     rgb = rgb_u8.astype(np.float32)
@@ -1202,7 +1286,15 @@ def _find_chat_bubbles(
     u8 = cv2.morphologyEx(seed.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     u8 = cv2.morphologyEx(u8, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(u8)
-    out = np.zeros((h, w), dtype=bool)
+    detected_bubbles = _detection_mask(rgb_u8.shape[:2], detections, CHAT_BUBBLE_CLASSES)
+    # The detector's right-bubble box often wraps a green outgoing bubble;
+    # remove that box plus a narrow halo so it cannot create a gray rectangle.
+    green_neighborhood = cv2.dilate(green.astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+    detected_bubbles &= ~green_neighborhood
+    out = detected_bubbles
+    out |= _find_chat_voice_bubbles(rgb_u8, detections)
+    out[: int(0.105 * h)] = False
+    out[int(0.90 * h) :] = False
     for i, (x, y, bw, bh, area) in enumerate(stats[1:], 1):
         fill = area / float(max(bw * bh, 1))
         pixels = lum[labels == i]
@@ -1785,7 +1877,7 @@ def _convert_chat_rgb(
     out[:] = TARGET_BG
     avatar, _avatar_boxes = _find_chat_avatars(rgb_u8)
     green = _find_chat_green_bubbles(rgb_u8)
-    bubbles = _find_chat_bubbles(rgb_u8, avatar, green)
+    bubbles = _find_chat_bubbles(rgb_u8, avatar, green, detections)
     media = _find_chat_media(rgb_u8, avatar, bubbles, green)
     media |= _detection_mask(rgb_u8.shape[:2], detections, CHAT_MEDIA_CLASSES, padding=2)
     text = _find_chat_text(rgb_u8, footer_start, avatar, bubbles, green, media)
