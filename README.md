@@ -232,11 +232,11 @@ while read f; do
 
 for ext in jpg jpeg png; do
 
-[ -f "images/train/f.ext" ] && mv "images/train/f.ext" "images/val/"
+[ -f "images/train/${f}.${ext}" ] && mv "images/train/${f}.${ext}" "images/val/"
 
 done
 
-[ -f "labels/train/f.txt" ] && mv "labels/train/f.txt" "labels/val/"
+[ -f "labels/train/${f}.txt" ] && mv "labels/train/${f}.txt" "labels/val/"
 
 done < val_files.txt
 
