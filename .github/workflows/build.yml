@@ -33,7 +33,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install opencv-python numpy pillow onnx onnxruntime pyinstaller
+          pip install opencv-python numpy pillow onnx onnxruntime PyMuPDF pyinstaller
 
       - name: Build with PyInstaller (Linux)
         run: |
@@ -66,11 +66,11 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install opencv-python numpy pillow onnx onnxruntime pyinstaller
+          pip install opencv-python numpy pillow onnx onnxruntime PyMuPDF pyinstaller
 
       - name: Build with PyInstaller (Windows)
         run: |
-          pyinstaller --onefile `
+          pyinstaller --onefile --windowed `
             --add-data "best.onnx;." `
             --name wechat2white-windows `
             pdf_bg_to_white.py

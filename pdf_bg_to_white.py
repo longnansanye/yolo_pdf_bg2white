@@ -7,8 +7,13 @@ import argparse
 import ast
 import io
 import math
+import platform
+import queue
+import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -1837,6 +1842,13 @@ def _to_rgb_array(img: Image.Image) -> np.ndarray:
     return np.asarray(img)
 
 
+def _emit_log(message: str, callback: Callable[[str], None] | None = None) -> None:
+    if callback is not None:
+        callback(message)
+    elif sys.stdout is not None:
+        print(message)
+
+
 def _process_image(
     img: Image.Image,
     detector: YoloDetector | None = None,
@@ -1860,6 +1872,7 @@ def convert_image(
     input_image: Path,
     output_image: Path,
     detector: YoloDetector | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> None:
     if not input_image.is_file():
         raise FileNotFoundError(f"输入图片不存在: {input_image}")
@@ -1875,7 +1888,7 @@ def convert_image(
         out.save(output_image, format="PNG", optimize=True)
     else:
         raise ValueError("单图输出格式仅支持 .jpg/.jpeg/.png")
-    print(f"Saved: {output_image} (kind={kind}, detections={len(detections)})")
+    _emit_log(f"Saved: {output_image} (kind={kind}, detections={len(detections)})", log)
 
 
 def process_pdf(
@@ -1884,6 +1897,7 @@ def process_pdf(
     dump_dir: Path | None = None,
     processed_dir: Path | None = None,
     detector: YoloDetector | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> None:
     import fitz
 
@@ -1905,7 +1919,7 @@ def process_pdf(
                 try:
                     raw = doc.extract_image(xref)
                 except Exception as e:
-                    print(f"[skip] page={page_index} xref={xref}: {e}")
+                    _emit_log(f"[skip] page={page_index} xref={xref}: {e}", log)
                     continue
                 data = raw["image"]
                 if dump_dir is not None:
@@ -1914,26 +1928,31 @@ def process_pdf(
                 try:
                     new_bytes = process_image_bytes(data, detector)
                 except Exception as e:
-                    print(f"[fail] page={page_index} xref={xref}: {e}")
+                    _emit_log(f"[fail] page={page_index} xref={xref}: {e}", log)
                     img_i += 1
                     continue
                 xref_cache[xref] = new_bytes
                 if processed_dir is not None:
                     (processed_dir / f"img_{img_i:04d}.jpg").write_bytes(new_bytes)
-                print(f"[ok] page={page_index} xref={xref} -> img_{img_i:04d}")
+                _emit_log(f"[ok] page={page_index} xref={xref} -> img_{img_i:04d}", log)
             try:
                 page.replace_image(xref, stream=new_bytes)
             except Exception as e:
-                print(f"[replace-fail] page={page_index} xref={xref}: {e}")
+                _emit_log(f"[replace-fail] page={page_index} xref={xref}: {e}", log)
             img_i += 1
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_pdf, deflate=True, garbage=3)
     doc.close()
-    print(f"Saved: {output_pdf}")
+    _emit_log(f"Saved: {output_pdf}", log)
 
 
-def rebuild_pdf_from_processed(input_pdf: Path, processed_dir: Path, output_pdf: Path) -> None:
+def rebuild_pdf_from_processed(
+    input_pdf: Path,
+    processed_dir: Path,
+    output_pdf: Path,
+    log: Callable[[str], None] | None = None,
+) -> None:
     """Rebuild a PDF from already-processed images, using input.pdf as layout template.
 
     Image indices follow the exact traversal order used by process_pdf (per page,
@@ -1960,7 +1979,10 @@ def rebuild_pdf_from_processed(input_pdf: Path, processed_dir: Path, output_pdf:
             else:
                 path = processed_dir / f"img_{img_i:04d}.jpg"
                 if not path.exists():
-                    print(f"[missing] page={page_index} xref={xref}: {path.name} 不存在，保留原图")
+                    _emit_log(
+                        f"[missing] page={page_index} xref={xref}: {path.name} 不存在，保留原图",
+                        log,
+                    )
                     missing += 1
                     img_i += 1
                     continue
@@ -1970,16 +1992,373 @@ def rebuild_pdf_from_processed(input_pdf: Path, processed_dir: Path, output_pdf:
                 page.replace_image(xref, stream=new_bytes)
                 replaced += 1
             except Exception as e:
-                print(f"[replace-fail] page={page_index} xref={xref}: {e}")
+                _emit_log(f"[replace-fail] page={page_index} xref={xref}: {e}", log)
             img_i += 1
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_pdf, deflate=True, garbage=3)
     doc.close()
-    print(f"Saved: {output_pdf} (replaced={replaced}, missing={missing})")
+    _emit_log(f"Saved: {output_pdf} (replaced={replaced}, missing={missing})", log)
+
+
+def _create_detector(
+    base: Path,
+    model: str | None,
+    confidence: float,
+    iou: float,
+    imgsz: int,
+    no_yolo: bool,
+) -> YoloDetector | None:
+    if no_yolo:
+        return None
+
+    if model:
+        model_path = Path(model).expanduser()
+        if not model_path.is_absolute():
+            model_path = Path.cwd() / model_path
+    else:
+        model_path = base / "best.onnx"
+    return YoloDetector(model_path, confidence=confidence, iou=iou, imgsz=imgsz)
+
+
+def run_windows_gui() -> None:
+    """Run the Windows-only Tkinter front end."""
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    base = Path(__file__).resolve().parent
+
+    class WindowsApp:
+        def __init__(self, root: tk.Tk):
+            self.root = root
+            self.root.title("WeChat2White")
+            self.root.geometry("780x650")
+            self.root.minsize(700, 560)
+            self.root.columnconfigure(0, weight=1)
+            self.root.rowconfigure(4, weight=1)
+
+            self.mode = tk.StringVar(value="image")
+            self.input_path = tk.StringVar()
+            self.output_path = tk.StringVar()
+            self.model_path = tk.StringVar(value=str(base / "best.onnx"))
+            self.confidence = tk.StringVar(value="0.25")
+            self.iou = tk.StringVar(value="0.45")
+            self.imgsz = tk.StringVar(value="640")
+            self.no_yolo = tk.BooleanVar(value=False)
+            self.status = tk.StringVar(value="请选择输入文件或 PDF 文件夹")
+            self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+
+            self._build_widgets()
+            self._on_mode_changed()
+            self.root.after(100, self._poll_events)
+
+        def _build_widgets(self) -> None:
+            mode_frame = ttk.LabelFrame(self.root, text="转换类型", padding=8)
+            mode_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+            ttk.Radiobutton(
+                mode_frame,
+                text="转换单张图片",
+                variable=self.mode,
+                value="image",
+                command=self._on_mode_changed,
+            ).grid(row=0, column=0, padx=(0, 24), sticky="w")
+            ttk.Radiobutton(
+                mode_frame,
+                text="转换文件夹中的 PDF",
+                variable=self.mode,
+                value="pdf_folder",
+                command=self._on_mode_changed,
+            ).grid(row=0, column=1, sticky="w")
+
+            input_frame = ttk.LabelFrame(self.root, text="输入", padding=8)
+            input_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
+            input_frame.columnconfigure(1, weight=1)
+            self.input_label = ttk.Label(input_frame, width=12)
+            self.input_label.grid(row=0, column=0, sticky="w")
+            ttk.Entry(input_frame, textvariable=self.input_path).grid(
+                row=0, column=1, sticky="ew", padx=8
+            )
+            self.input_button = ttk.Button(input_frame, command=self._browse_input)
+            self.input_button.grid(row=0, column=2, sticky="e")
+
+            output_frame = ttk.LabelFrame(self.root, text="输出", padding=8)
+            output_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=6)
+            output_frame.columnconfigure(1, weight=1)
+            self.output_label = ttk.Label(output_frame, width=12)
+            self.output_label.grid(row=0, column=0, sticky="w")
+            ttk.Entry(output_frame, textvariable=self.output_path).grid(
+                row=0, column=1, sticky="ew", padx=8
+            )
+            self.output_button = ttk.Button(output_frame, command=self._browse_output)
+            self.output_button.grid(row=0, column=2, sticky="e")
+
+            params_frame = ttk.LabelFrame(self.root, text="处理参数", padding=8)
+            params_frame.grid(row=3, column=0, sticky="ew", padx=12, pady=6)
+            params_frame.columnconfigure(1, weight=1)
+            ttk.Label(params_frame, text="YOLO 模型").grid(row=0, column=0, sticky="w")
+            ttk.Entry(params_frame, textvariable=self.model_path).grid(
+                row=0, column=1, columnspan=4, sticky="ew", padx=8
+            )
+            ttk.Button(params_frame, text="选择文件", command=self._browse_model).grid(
+                row=0, column=5, sticky="e"
+            )
+            ttk.Label(params_frame, text="置信度").grid(row=1, column=0, sticky="w", pady=(8, 0))
+            ttk.Entry(params_frame, textvariable=self.confidence, width=10).grid(
+                row=1, column=1, sticky="w", padx=8, pady=(8, 0)
+            )
+            ttk.Label(params_frame, text="IoU").grid(row=1, column=2, sticky="w", pady=(8, 0))
+            ttk.Entry(params_frame, textvariable=self.iou, width=10).grid(
+                row=1, column=3, sticky="w", padx=8, pady=(8, 0)
+            )
+            ttk.Label(params_frame, text="推理尺寸").grid(row=1, column=4, sticky="w", pady=(8, 0))
+            ttk.Entry(params_frame, textvariable=self.imgsz, width=10).grid(
+                row=1, column=5, sticky="w", padx=8, pady=(8, 0)
+            )
+            ttk.Checkbutton(
+                params_frame,
+                text="禁用 YOLO，使用启发式判断",
+                variable=self.no_yolo,
+            ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 0))
+
+            log_frame = ttk.LabelFrame(self.root, text="处理日志", padding=8)
+            log_frame.grid(row=4, column=0, sticky="nsew", padx=12, pady=6)
+            log_frame.rowconfigure(0, weight=1)
+            log_frame.columnconfigure(0, weight=1)
+            self.log = tk.Text(log_frame, height=12, wrap="word", state="normal")
+            self.log.grid(row=0, column=0, sticky="nsew")
+            log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+            log_scrollbar.grid(row=0, column=1, sticky="ns")
+            self.log.configure(yscrollcommand=log_scrollbar.set)
+
+            action_frame = ttk.Frame(self.root, padding=(12, 6, 12, 12))
+            action_frame.grid(row=5, column=0, sticky="ew")
+            action_frame.columnconfigure(1, weight=1)
+            self.start_button = ttk.Button(action_frame, text="开始转换", command=self._start)
+            self.start_button.grid(row=0, column=0, sticky="w")
+            self.progress = ttk.Progressbar(action_frame, mode="determinate", length=240)
+            self.progress.grid(row=0, column=1, sticky="ew", padx=12)
+            ttk.Label(action_frame, textvariable=self.status).grid(row=0, column=2, sticky="e")
+
+        def _on_mode_changed(self) -> None:
+            is_image = self.mode.get() == "image"
+            self.input_label.configure(text="图片文件" if is_image else "PDF 文件夹")
+            self.output_label.configure(text="输出图片" if is_image else "输出文件夹")
+            self.input_button.configure(text="选择文件" if is_image else "选择文件夹")
+            self.output_button.configure(text="选择文件" if is_image else "选择文件夹")
+            self.input_path.set("")
+            self.output_path.set("")
+
+        def _browse_input(self) -> None:
+            if self.mode.get() == "image":
+                selected = filedialog.askopenfilename(
+                    title="选择待转换图片",
+                    filetypes=[
+                        ("图片文件", "*.jpg *.jpeg *.png"),
+                        ("所有文件", "*.*"),
+                    ],
+                )
+            else:
+                selected = filedialog.askdirectory(title="选择包含 PDF 文件的文件夹")
+            if not selected:
+                return
+            self.input_path.set(selected)
+            input_path = Path(selected)
+            if self.mode.get() == "image":
+                suffix = input_path.suffix.lower()
+                if suffix not in {".jpg", ".jpeg", ".png"}:
+                    suffix = ".png"
+                self.output_path.set(str(input_path.with_name(f"{input_path.stem}_white{suffix}")))
+            else:
+                self.output_path.set(str(input_path / "converted"))
+
+        def _browse_output(self) -> None:
+            if self.mode.get() == "image":
+                current = Path(self.output_path.get()) if self.output_path.get() else None
+                selected = filedialog.asksaveasfilename(
+                    title="选择输出图片",
+                    initialdir=str(current.parent) if current else None,
+                    initialfile=current.name if current else "output_white.png",
+                    defaultextension=".png",
+                    filetypes=[
+                        ("PNG 图片", "*.png"),
+                        ("JPEG 图片", "*.jpg *.jpeg"),
+                    ],
+                )
+            else:
+                selected = filedialog.askdirectory(title="选择输出文件夹")
+            if selected:
+                self.output_path.set(selected)
+
+        def _browse_model(self) -> None:
+            selected = filedialog.askopenfilename(
+                title="选择 YOLO ONNX 模型",
+                filetypes=[("ONNX 模型", "*.onnx"), ("所有文件", "*.*")],
+            )
+            if selected:
+                self.model_path.set(selected)
+
+        def _collect_config(self) -> dict[str, object]:
+            input_value = self.input_path.get().strip()
+            if not input_value:
+                raise ValueError("请选择输入文件或 PDF 文件夹")
+            input_path = Path(input_value).expanduser()
+
+            try:
+                confidence = float(self.confidence.get().strip())
+                iou = float(self.iou.get().strip())
+                imgsz = int(self.imgsz.get().strip())
+            except ValueError as exc:
+                raise ValueError("置信度、IoU 必须是小数，推理尺寸必须是整数") from exc
+            if not 0 < confidence <= 1:
+                raise ValueError("置信度必须大于 0 且不超过 1")
+            if not 0 <= iou <= 1:
+                raise ValueError("IoU 必须在 0 到 1 之间")
+            if imgsz <= 0:
+                raise ValueError("推理尺寸必须大于 0")
+
+            if self.mode.get() == "image":
+                if not input_path.is_file():
+                    raise ValueError(f"图片不存在: {input_path}")
+                if input_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                    raise ValueError("单图输入仅支持 .jpg、.jpeg、.png")
+                output_value = self.output_path.get().strip()
+                output_path = Path(output_value).expanduser() if output_value else input_path.with_name(
+                    f"{input_path.stem}_white{input_path.suffix}"
+                )
+                if output_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                    raise ValueError("单图输出仅支持 .jpg、.jpeg、.png")
+                return {
+                    "mode": "image",
+                    "input": input_path,
+                    "output": output_path,
+                    "model": self.model_path.get().strip() or None,
+                    "confidence": confidence,
+                    "iou": iou,
+                    "imgsz": imgsz,
+                    "no_yolo": self.no_yolo.get(),
+                }
+
+            if not input_path.is_dir():
+                raise ValueError(f"PDF 文件夹不存在: {input_path}")
+            pdfs = sorted(
+                path for path in input_path.iterdir() if path.is_file() and path.suffix.lower() == ".pdf"
+            )
+            if not pdfs:
+                raise ValueError(f"文件夹中没有 PDF 文件: {input_path}")
+            output_value = self.output_path.get().strip()
+            output_dir = Path(output_value).expanduser() if output_value else input_path / "converted"
+            if output_dir.exists() and not output_dir.is_dir():
+                raise ValueError(f"输出路径不是文件夹: {output_dir}")
+            return {
+                "mode": "pdf_folder",
+                "pdfs": pdfs,
+                "output_dir": output_dir,
+                "model": self.model_path.get().strip() or None,
+                "confidence": confidence,
+                "iou": iou,
+                "imgsz": imgsz,
+                "no_yolo": self.no_yolo.get(),
+            }
+
+        def _start(self) -> None:
+            try:
+                config = self._collect_config()
+            except ValueError as exc:
+                messagebox.showerror("参数错误", str(exc))
+                return
+
+            item_count = 1 if config["mode"] == "image" else len(config["pdfs"])
+            self.log.delete("1.0", "end")
+            self.progress.configure(maximum=item_count, value=0)
+            self.status.set("正在处理...")
+            self.start_button.configure(state="disabled")
+            threading.Thread(target=self._convert, args=(config,), daemon=True).start()
+
+        def _queue_log(self, message: str) -> None:
+            self.events.put(("log", message))
+
+        def _convert(self, config: dict[str, object]) -> None:
+            try:
+                detector = _create_detector(
+                    base,
+                    config["model"],
+                    config["confidence"],
+                    config["iou"],
+                    config["imgsz"],
+                    config["no_yolo"],
+                )
+                if config["mode"] == "image":
+                    self._queue_log(f"开始转换: {config['input']}")
+                    convert_image(
+                        config["input"],
+                        config["output"],
+                        detector=detector,
+                        log=self._queue_log,
+                    )
+                    self.events.put(("progress", 1))
+                    self.events.put(("done", f"转换完成: {config['output']}"))
+                    return
+
+                pdfs = config["pdfs"]
+                output_dir = config["output_dir"]
+                failed: list[str] = []
+                for index, input_pdf in enumerate(pdfs, start=1):
+                    output_pdf = output_dir / f"{input_pdf.stem}_white.pdf"
+                    self._queue_log(f"[{index}/{len(pdfs)}] 开始: {input_pdf.name}")
+                    try:
+                        process_pdf(
+                            input_pdf,
+                            output_pdf,
+                            detector=detector,
+                            log=self._queue_log,
+                        )
+                    except Exception as exc:
+                        failed.append(input_pdf.name)
+                        self._queue_log(f"[失败] {input_pdf.name}: {exc}")
+                    self.events.put(("progress", index))
+
+                success_count = len(pdfs) - len(failed)
+                summary = f"完成：成功 {success_count} 个，失败 {len(failed)} 个\n输出目录：{output_dir}"
+                self.events.put(("done", summary))
+            except Exception as exc:
+                self.events.put(("error", f"{type(exc).__name__}: {exc}"))
+
+        def _append_log(self, message: str) -> None:
+            self.log.insert("end", f"{message}\n")
+            self.log.see("end")
+
+        def _poll_events(self) -> None:
+            try:
+                while True:
+                    event, payload = self.events.get_nowait()
+                    if event == "log":
+                        self._append_log(str(payload))
+                    elif event == "progress":
+                        self.progress.configure(value=payload)
+                    elif event == "done":
+                        self.start_button.configure(state="normal")
+                        self.status.set("处理完成")
+                        self._append_log(str(payload))
+                        messagebox.showinfo("转换完成", str(payload))
+                    elif event == "error":
+                        self.start_button.configure(state="normal")
+                        self.status.set("处理失败")
+                        self._append_log(str(payload))
+                        messagebox.showerror("转换失败", str(payload))
+            except queue.Empty:
+                pass
+            self.root.after(100, self._poll_events)
+
+    root = tk.Tk()
+    WindowsApp(root)
+    root.mainloop()
 
 
 def main() -> None:
+    if platform.system() == "Windows":
+        run_windows_gui()
+        return
+
     base = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description="微信深色截图 PDF/图片 -> 浅色主题；使用 best.onnx 做页面检测分类。",
@@ -2015,11 +2394,15 @@ def main() -> None:
     args = parser.parse_args()
 
     detector = None
-    if args.command != "rebuild" and not args.no_yolo:
-        model_path = Path(args.model) if args.model else base / "best.onnx"
-        if args.model and not model_path.is_absolute():
-            model_path = Path.cwd() / model_path
-        detector = YoloDetector(model_path, confidence=args.conf, iou=args.iou, imgsz=args.imgsz)
+    if args.command != "rebuild":
+        detector = _create_detector(
+            base,
+            args.model,
+            args.conf,
+            args.iou,
+            args.imgsz,
+            args.no_yolo,
+        )
 
     if args.command == "rebuild":
         if args.image_output is not None:
