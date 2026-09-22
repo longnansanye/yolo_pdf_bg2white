@@ -2035,17 +2035,18 @@ def run_windows_gui() -> None:
             self.root.geometry("780x650")
             self.root.minsize(700, 560)
             self.root.columnconfigure(0, weight=1)
-            self.root.rowconfigure(4, weight=1)
+            self.root.rowconfigure(5, weight=1)
 
             self.mode = tk.StringVar(value="image")
             self.input_path = tk.StringVar()
             self.output_path = tk.StringVar()
-            self.model_path = tk.StringVar(value=str(base / "best.onnx"))
+            self.image_output_path = tk.StringVar()
+            self.model_path = tk.StringVar()
             self.confidence = tk.StringVar(value="0.25")
             self.iou = tk.StringVar(value="0.45")
             self.imgsz = tk.StringVar(value="640")
             self.no_yolo = tk.BooleanVar(value=False)
-            self.status = tk.StringVar(value="请选择输入文件或 PDF 文件夹")
+            self.status = tk.StringVar(value="请选择输入图片或 PDF 文件")
             self.events: queue.Queue[tuple[str, object]] = queue.Queue()
 
             self._build_widgets()
@@ -2064,9 +2065,9 @@ def run_windows_gui() -> None:
             ).grid(row=0, column=0, padx=(0, 24), sticky="w")
             ttk.Radiobutton(
                 mode_frame,
-                text="转换文件夹中的 PDF",
+                text="转换单个 PDF",
                 variable=self.mode,
-                value="pdf_folder",
+                value="pdf",
                 command=self._on_mode_changed,
             ).grid(row=0, column=1, sticky="w")
 
@@ -2092,8 +2093,23 @@ def run_windows_gui() -> None:
             self.output_button = ttk.Button(output_frame, command=self._browse_output)
             self.output_button.grid(row=0, column=2, sticky="e")
 
+            self.image_output_frame = ttk.LabelFrame(self.root, text="图片输出", padding=8)
+            self.image_output_frame.grid(row=3, column=0, sticky="ew", padx=12, pady=6)
+            self.image_output_frame.columnconfigure(1, weight=1)
+            ttk.Label(self.image_output_frame, text="图片输出目录", width=12).grid(
+                row=0, column=0, sticky="w"
+            )
+            ttk.Entry(self.image_output_frame, textvariable=self.image_output_path).grid(
+                row=0, column=1, sticky="ew", padx=8
+            )
+            ttk.Button(
+                self.image_output_frame,
+                text="选择目录",
+                command=self._browse_image_output,
+            ).grid(row=0, column=2, sticky="e")
+
             params_frame = ttk.LabelFrame(self.root, text="处理参数", padding=8)
-            params_frame.grid(row=3, column=0, sticky="ew", padx=12, pady=6)
+            params_frame.grid(row=4, column=0, sticky="ew", padx=12, pady=6)
             params_frame.columnconfigure(1, weight=1)
             ttk.Label(params_frame, text="YOLO 模型").grid(row=0, column=0, sticky="w")
             ttk.Entry(params_frame, textvariable=self.model_path).grid(
@@ -2121,7 +2137,7 @@ def run_windows_gui() -> None:
             ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 0))
 
             log_frame = ttk.LabelFrame(self.root, text="处理日志", padding=8)
-            log_frame.grid(row=4, column=0, sticky="nsew", padx=12, pady=6)
+            log_frame.grid(row=5, column=0, sticky="nsew", padx=12, pady=6)
             log_frame.rowconfigure(0, weight=1)
             log_frame.columnconfigure(0, weight=1)
             self.log = tk.Text(log_frame, height=12, wrap="word", state="normal")
@@ -2131,7 +2147,7 @@ def run_windows_gui() -> None:
             self.log.configure(yscrollcommand=log_scrollbar.set)
 
             action_frame = ttk.Frame(self.root, padding=(12, 6, 12, 12))
-            action_frame.grid(row=5, column=0, sticky="ew")
+            action_frame.grid(row=6, column=0, sticky="ew")
             action_frame.columnconfigure(1, weight=1)
             self.start_button = ttk.Button(action_frame, text="开始转换", command=self._start)
             self.start_button.grid(row=0, column=0, sticky="w")
@@ -2141,12 +2157,17 @@ def run_windows_gui() -> None:
 
         def _on_mode_changed(self) -> None:
             is_image = self.mode.get() == "image"
-            self.input_label.configure(text="图片文件" if is_image else "PDF 文件夹")
-            self.output_label.configure(text="输出图片" if is_image else "输出文件夹")
-            self.input_button.configure(text="选择文件" if is_image else "选择文件夹")
-            self.output_button.configure(text="选择文件" if is_image else "选择文件夹")
+            self.input_label.configure(text="图片文件" if is_image else "PDF 文件")
+            self.output_label.configure(text="输出图片" if is_image else "输出 PDF")
+            self.input_button.configure(text="选择文件" if is_image else "选择 PDF")
+            self.output_button.configure(text="选择文件" if is_image else "选择输出")
+            if is_image:
+                self.image_output_frame.grid_remove()
+            else:
+                self.image_output_frame.grid()
             self.input_path.set("")
             self.output_path.set("")
+            self.image_output_path.set("")
 
         def _browse_input(self) -> None:
             if self.mode.get() == "image":
@@ -2158,7 +2179,10 @@ def run_windows_gui() -> None:
                     ],
                 )
             else:
-                selected = filedialog.askdirectory(title="选择包含 PDF 文件的文件夹")
+                selected = filedialog.askopenfilename(
+                    title="选择待转换 PDF",
+                    filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
+                )
             if not selected:
                 return
             self.input_path.set(selected)
@@ -2169,7 +2193,8 @@ def run_windows_gui() -> None:
                     suffix = ".png"
                 self.output_path.set(str(input_path.with_name(f"{input_path.stem}_white{suffix}")))
             else:
-                self.output_path.set(str(input_path / "converted"))
+                self.output_path.set(str(input_path.with_name(f"{input_path.stem}_white.pdf")))
+                self.image_output_path.set(str(input_path.with_name(f"{input_path.stem}_images")))
 
         def _browse_output(self) -> None:
             if self.mode.get() == "image":
@@ -2185,9 +2210,21 @@ def run_windows_gui() -> None:
                     ],
                 )
             else:
-                selected = filedialog.askdirectory(title="选择输出文件夹")
+                current = Path(self.output_path.get()) if self.output_path.get() else None
+                selected = filedialog.asksaveasfilename(
+                    title="选择输出 PDF",
+                    initialdir=str(current.parent) if current else None,
+                    initialfile=current.name if current else "output_white.pdf",
+                    defaultextension=".pdf",
+                    filetypes=[("PDF 文件", "*.pdf")],
+                )
             if selected:
                 self.output_path.set(selected)
+
+        def _browse_image_output(self) -> None:
+            selected = filedialog.askdirectory(title="选择图片输出目录")
+            if selected:
+                self.image_output_path.set(selected)
 
         def _browse_model(self) -> None:
             selected = filedialog.askopenfilename(
@@ -2200,7 +2237,7 @@ def run_windows_gui() -> None:
         def _collect_config(self) -> dict[str, object]:
             input_value = self.input_path.get().strip()
             if not input_value:
-                raise ValueError("请选择输入文件或 PDF 文件夹")
+                raise ValueError("请选择输入图片或 PDF 文件")
             input_path = Path(input_value).expanduser()
 
             try:
@@ -2238,21 +2275,29 @@ def run_windows_gui() -> None:
                     "no_yolo": self.no_yolo.get(),
                 }
 
-            if not input_path.is_dir():
-                raise ValueError(f"PDF 文件夹不存在: {input_path}")
-            pdfs = sorted(
-                path for path in input_path.iterdir() if path.is_file() and path.suffix.lower() == ".pdf"
-            )
-            if not pdfs:
-                raise ValueError(f"文件夹中没有 PDF 文件: {input_path}")
+            if not input_path.is_file():
+                raise ValueError(f"PDF 文件不存在: {input_path}")
+            if input_path.suffix.lower() != ".pdf":
+                raise ValueError("PDF 输入必须是 .pdf 文件")
             output_value = self.output_path.get().strip()
-            output_dir = Path(output_value).expanduser() if output_value else input_path / "converted"
-            if output_dir.exists() and not output_dir.is_dir():
-                raise ValueError(f"输出路径不是文件夹: {output_dir}")
+            output_path = Path(output_value).expanduser() if output_value else input_path.with_name(
+                f"{input_path.stem}_white.pdf"
+            )
+            if output_path.suffix.lower() != ".pdf":
+                raise ValueError("PDF 输出必须使用 .pdf 扩展名")
+            image_output_value = self.image_output_path.get().strip()
+            image_output_dir = (
+                Path(image_output_value).expanduser()
+                if image_output_value
+                else input_path.with_name(f"{input_path.stem}_images")
+            )
+            if image_output_dir.exists() and not image_output_dir.is_dir():
+                raise ValueError(f"图片输出路径不是文件夹: {image_output_dir}")
             return {
-                "mode": "pdf_folder",
-                "pdfs": pdfs,
-                "output_dir": output_dir,
+                "mode": "pdf",
+                "input": input_path,
+                "output": output_path,
+                "image_output_dir": image_output_dir,
                 "model": self.model_path.get().strip() or None,
                 "confidence": confidence,
                 "iou": iou,
@@ -2267,7 +2312,7 @@ def run_windows_gui() -> None:
                 messagebox.showerror("参数错误", str(exc))
                 return
 
-            item_count = 1 if config["mode"] == "image" else len(config["pdfs"])
+            item_count = 1
             self.log.delete("1.0", "end")
             self.progress.configure(maximum=item_count, value=0)
             self.status.set("正在处理...")
@@ -2299,27 +2344,23 @@ def run_windows_gui() -> None:
                     self.events.put(("done", f"转换完成: {config['output']}"))
                     return
 
-                pdfs = config["pdfs"]
-                output_dir = config["output_dir"]
-                failed: list[str] = []
-                for index, input_pdf in enumerate(pdfs, start=1):
-                    output_pdf = output_dir / f"{input_pdf.stem}_white.pdf"
-                    self._queue_log(f"[{index}/{len(pdfs)}] 开始: {input_pdf.name}")
-                    try:
-                        process_pdf(
-                            input_pdf,
-                            output_pdf,
-                            detector=detector,
-                            log=self._queue_log,
-                        )
-                    except Exception as exc:
-                        failed.append(input_pdf.name)
-                        self._queue_log(f"[失败] {input_pdf.name}: {exc}")
-                    self.events.put(("progress", index))
-
-                success_count = len(pdfs) - len(failed)
-                summary = f"完成：成功 {success_count} 个，失败 {len(failed)} 个\n输出目录：{output_dir}"
-                self.events.put(("done", summary))
+                self._queue_log(f"开始转换: {config['input']}")
+                image_output_dir = config["image_output_dir"]
+                process_pdf(
+                    config["input"],
+                    config["output"],
+                    dump_dir=image_output_dir / "extracted_images",
+                    processed_dir=image_output_dir / "processed_images",
+                    detector=detector,
+                    log=self._queue_log,
+                )
+                self.events.put(("progress", 1))
+                self.events.put(
+                    (
+                        "done",
+                        f"转换完成: {config['output']}\n图片目录: {image_output_dir}",
+                    )
+                )
             except Exception as exc:
                 self.events.put(("error", f"{type(exc).__name__}: {exc}"))
 

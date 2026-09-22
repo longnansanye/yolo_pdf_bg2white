@@ -414,7 +414,8 @@ python3 pdf_bg_to_white.py --help
 Windows 下直接运行 `pdf_bg_to_white.py` 或打包后的 `wechat2white-windows.exe` 会打开图形界面，可以选择：
 
 - 转换单张 `.jpg`、`.jpeg` 或 `.png` 图片；
-- 转换指定文件夹中的全部 PDF，结果默认保存到该文件夹的 `converted/` 子目录；
+- 选择并转换单个 PDF，默认生成同目录下的 `<原文件名>_white.pdf`；
+- 为 PDF 选择图片输出目录，目录下会保存 `extracted_images/` 和 `processed_images/`；
 - 设置 YOLO 模型路径、置信度、IoU、推理尺寸，或关闭 YOLO 改用启发式判断。
 
 Linux 仍使用上面的命令行方式，不会打开图形界面。
