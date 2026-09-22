@@ -36,9 +36,7 @@ yolo_pdf_bg2white/
 
 ├── dataset.yaml                 # 数据集配置文件
 
-├── wechat_to_white.py           # 单张图片处理脚本
-
-├── batch_process.py             # 批量处理脚本
+├── pdf_bg_to_white.py           # PDF/单张图片转换脚本
 
 ├── convert_labels.py            # 类别映射转换脚本（如需精简类别）
 
@@ -110,14 +108,14 @@ source venv/bin/activate
 升级 pip
 pip install --upgrade pip
 
-安装 CPU 版 PyTorch
+训练和导出模型时安装 CPU 版 PyTorch
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-安装主依赖
-pip install ultralytics opencv-python numpy pillow
+安装推理依赖
+pip install onnxruntime opencv-python numpy pillow
 
-安装 ONNX 推理依赖
-pip install onnx onnxruntime
+训练和导出模型时额外安装
+pip install ultralytics onnx
 
 纯文本
 > ⚠️ 如果 `onnx` / `onnxruntime` 安装失败，尝试指定版本：
@@ -353,22 +351,149 @@ device=cpu
 导出成功后得到：
 runs/detect/wechat_bubble/exp1/weights/best.onnx
 
-纯文本
-### 5. 运行推理
-bash
+### 5. 使用 `pdf_bg_to_white.py`
 
-处理单张图片
-python3 wechat_to_white.py input.jpg -o output.jpg
+脚本默认从脚本同级目录加载 `best.onnx`。如果使用虚拟环境，请先激活环境；也可以直接使用仓库中的解释器 `./bin/python`。
+运行时直接使用 ONNX Runtime，不需要安装 Ultralytics、PyTorch 或 TorchVision。
 
-批量处理
-python3 batch_process.py --input_dir ./screenshots/ --output_dir ./output/
+#### 5.1 转换单张图片
 
-纯文本
+```bash
+# 指定输出路径
+python3 pdf_bg_to_white.py image input.jpg output.jpg
+
+# 省略输出路径，默认生成 input_white.jpg
+python3 pdf_bg_to_white.py image input.jpg
+```
+
+单图输出格式支持 `.jpg`、`.jpeg` 和 `.png`。模型路径不是默认位置时，使用 `--model` 指定：
+
+```bash
+python3 pdf_bg_to_white.py image input.png output.png \
+  --model /path/to/best.onnx
+```
+
+#### 5.2 转换 PDF
+
+将待处理的 PDF 命名为脚本目录下的 `input.pdf`，运行：
+
+```bash
+python3 pdf_bg_to_white.py process
+```
+
+处理结果保存为 `output.pdf`；提取的原图和处理后的图片分别保存到 `extracted_images/`、`processed_images/`。
+
+#### 5.3 从已处理图片重建 PDF
+
+如果已经有 `processed_images/`，可以跳过重新检测，直接重建 PDF：
+
+```bash
+python3 pdf_bg_to_white.py rebuild rebuilt.pdf
+```
+
+该命令使用 `input.pdf` 作为版式模板，并从 `processed_images/` 读取处理后的图片。
+
+#### 5.4 常用参数
+
+```text
+--model PATH    YOLO ONNX 模型路径，默认使用脚本目录下的 best.onnx
+--conf FLOAT    检测置信度阈值，默认 0.25
+--iou FLOAT     NMS IoU 阈值，默认 0.45
+--imgsz INT     YOLO 推理尺寸，默认 640
+--no-yolo       禁用 YOLO，使用图像启发式判断
+```
+
+查看完整帮助：
+
+```bash
+python3 pdf_bg_to_white.py --help
+```
+
 ---
+
+PyInstaller 打包
+source /new/test/yolo_pdf_bg2white/bin/activate
+# 安装 PyInstaller
+pip install pyinstaller
+
+# 打包（脚本为 pdf_bg_to_white.py）
+pyinstaller --onefile --noupx \
+  --add-data "runs/detect/wechat_bubble/exp1/weights/best.onnx:." \
+  --name wechat2white \
+  pdf_bg_to_white.py
+dist/wechat2white          # Linux 可执行文件
+
+增量训练（保留旧知识）
+# 把新标注数据合并到数据集
+cp 新标注图片/*.jpg YOLODataset/images/train/
+cp 新标注图片/*.txt YOLODataset/labels/train/
+
+# 重新划分验证集（保持 80%/20% 比例）
+cd YOLODataset
+# 先把之前的 val 挪回 train（为了重新随机划分）
+mv images/val/*.jpg images/train/ 2>/dev/null
+mv labels/val/*.txt labels/train/ 2>/dev/null
+
+# 重新随机划分
+ls images/train/ | sed 's/\.[^.]*$//' | shuf > all_files.txt
+total=$(wc -l < all_files.txt)
+val_count=$((total * 20 / 100))
+[ "$val_count" -eq 0 ] && val_count=1
+head -n $val_count all_files.txt > val_files.txt
+while read f; do
+  for ext in jpg jpeg png; do
+    [ -f "images/train/${f}.${ext}" ] && mv "images/train/${f}.${ext}" "images/val/"
+  done
+  [ -f "labels/train/${f}.txt" ] && mv "labels/train/${f}.txt" "labels/val/"
+done < val_files.txt
+rm all_files.txt val_files.txt
+cd ..
+
+echo "训练集: $(ls YOLODataset/images/train/ | wc -l) 张"
+echo "验证集: $(ls YOLODataset/images/val/ | wc -l) 张"
+执行增量训练
+bash
+# 用现有的 best.pt 继续训练，epochs 可以设少一点
+yolo detect train \
+  model=runs/detect/wechat_bubble/exp1/weights/best.pt \
+  data=dataset.yaml \
+  imgsz=640 \
+  epochs=50 \          # 新数据少，50 轮就够了
+  batch=8 \
+  patience=20 \
+  project=wechat_bubble \
+  name=exp2 \          # 新实验名，避免覆盖旧的
+  device=cpu \
+  resume=False         # 这里是继续训练，不是恢复中断
+3.4 评估新旧模型对比
+bash
+# 旧模型验证
+yolo val model=runs/detect/wechat_bubble/exp1/weights/best.pt data=dataset.yaml
+
+# 新模型验证
+yolo val model=runs/detect/wechat_bubble/exp2/weights/best.pt data=dataset.yaml
+
+比较两者的 mAP50，如果新模型更好，就用新的。
+
+3.5 导出新版 ONNX + 重新打包
+bash
+# 导出新 ONNX
+yolo export \
+  model=runs/detect/wechat_bubble/exp2/weights/best.pt \
+  format=onnx \
+  imgsz=640 \
+  device=cpu
+
+# 重新打包linux版本（更新 ONNX 文件路径）
+pyinstaller --onefile \
+  --add-data "runs/detect/wechat_bubble/exp2/weights/best.onnx:." \
+  --name wechat2white_v2 \
+  pdf_bg_to_white.py
+
 
 ## ⚙️ 核心处理逻辑
 
-处理脚本 `wechat_to_white.py` 的工作流程：
+处理脚本 `pdf_bg_to_white.py` 的工作流程：
 
 1. **加载 ONNX 模型** → 初始化推理会话
 2. **预处理** → Letterbox 缩放至 640×640，归一化，BGR→RGB
@@ -457,3 +582,22 @@ bash
 
 yolo export model=best.pt format=onnx imgsz=640 dynamic=True device=cpu
 
+推荐路线
+
+继续用 yolov8n 做基线
+
+数据增加到 150~300 张，每类至少 10~30 个实例
+
+再训一次 yolov8n→ exp2
+
+如果气泡/照片仍漏检：
+
+先试 yolov8s
+
+数据够 300+ 再试 yolov8m
+
+部署时：
+
+边缘/CPU/打包分发 → n或 s
+
+服务器/Intel CPU 用 OpenVINO → 可以上 m

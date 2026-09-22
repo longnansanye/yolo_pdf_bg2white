@@ -1,0 +1,103 @@
+name: Build WeChat2White
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-glx libglib2.0-0
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install opencv-python numpy pillow onnx onnxruntime pyinstaller
+
+      - name: Build with PyInstaller (Linux)
+        run: |
+          pyinstaller --onefile \
+            --add-data "best.onnx:." \
+            --name wechat2white-linux \
+            pdf_bg_to_white.py
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wechat2white-linux
+          path: dist/wechat2white-linux
+
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install opencv-python numpy pillow onnx onnxruntime pyinstaller
+
+      - name: Build with PyInstaller (Windows)
+        run: |
+          pyinstaller --onefile `
+            --add-data "best.onnx;." `
+            --name wechat2white-windows `
+            pdf_bg_to_white.py
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wechat2white-windows
+          path: dist/wechat2white-windows.exe
+
+  create-release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/wechat2white-linux/wechat2white-linux
+            artifacts/wechat2white-windows/wechat2white-windows.exe
+          draft: false
+          prerelease: false
+          generate_release_notes: true
