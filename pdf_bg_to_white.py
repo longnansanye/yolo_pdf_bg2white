@@ -31,6 +31,8 @@ AVATAR_DETECTION_CLASSES = frozenset(
 FILE_BROWSE_DETECTION_CLASSES = frozenset({"file_item", "file_path_bar"})
 CHAT_BUBBLE_CLASSES = frozenset({"chat_bubble_left", "chat_bubble_right"})
 CHAT_VOICE_CLASSES = frozenset({"chat_voice_left", "chat_voice_right"})
+CHAT_TIMESTAMP_CLASSES = frozenset({"chat_timestamp"})
+CHAT_NAME_CLASSES = frozenset({"chat_name"})
 # Only image messages are eligible for byte-for-byte preservation. Voice
 # detections go through the neutral-bubble recolor path after visual recheck.
 CHAT_MEDIA_CLASSES = frozenset(
@@ -1476,9 +1478,25 @@ def _paint_chat_dates(
     chroma: np.ndarray,
     protect: np.ndarray,
     bg_level: float,
+    detections: list[Detection] | None = None,
 ) -> None:
     """Clear centered gray date rows before painting their complete strokes."""
     h, w = lum.shape
+    detected_timestamps = _detection_mask(
+        lum.shape,
+        detections,
+        CHAT_TIMESTAMP_CLASSES,
+        padding=2,
+    )
+    detected_names = _detection_mask(
+        lum.shape,
+        detections,
+        CHAT_NAME_CLASSES,
+        padding=3,
+    )
+    # Timestamp detection has priority over the generic top-band exclusion,
+    # but a nearby chat name always remains protected from the date wipe.
+    date_protect = protect | detected_names
     if bg_level >= 35.0:
         baseline = cv2.GaussianBlur(lum, (31, 31), 0)
         seed = (
@@ -1486,18 +1504,34 @@ def _paint_chat_dates(
             & (lum > bg_level + 8.0)
             & (lum < 180.0)
             & ((lum - baseline) > 12.0)
-            & ~protect
+            & ~date_protect
         )
         seed[: int(0.10 * h)] = False
     else:
-        seed = (chroma < 50.0) & (lum > bg_level + 8.0) & (lum < 180.0) & ~protect
+        seed = (chroma < 50.0) & (lum > bg_level + 8.0) & (lum < 180.0) & ~date_protect
         seed[: int(0.12 * h)] = False
+    forced_seed = np.zeros((h, w), dtype=bool)
+    if np.any(detected_timestamps):
+        forced_seed = (
+            detected_timestamps
+            & (chroma < 55.0)
+            & (lum > bg_level + 8.0)
+            & (lum < 180.0)
+            & ~date_protect
+        )
+        seed |= forced_seed
     seed[int(0.90 * h) :] = False
     if bg_level >= 35.0:
         seed = cv2.morphologyEx(seed.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)) > 0
+        seed |= forced_seed
+    seed[int(0.90 * h) :] = False
     x0, x1 = int(0.12 * w), int(0.88 * w)
     row_count = seed[:, x0:x1].sum(axis=1)
-    good = row_count > 8
+    # A dark input field can touch the last date row before the fixed footer
+    # cutoff. Its nearly full-width background must not make the date band
+    # fail the height check.
+    row_limit = max(32, int(0.72 * (x1 - x0)))
+    good = (row_count > 8) & (row_count < row_limit)
     good = cv2.morphologyEx(
         good.astype(np.uint8)[:, None],
         cv2.MORPH_CLOSE,
@@ -1522,7 +1556,7 @@ def _paint_chat_dates(
         ya, yb = max(0, y0 - pad_y), min(h, y1 + pad_y)
         roi = np.zeros((h, w), dtype=bool)
         roi[ya:yb, xa:xb] = True
-        editable = roi & ~protect
+        editable = roi & ~date_protect
         out[editable] = TARGET_BG
         ink_seed = editable & (chroma < 55.0) & (lum > bg_level + 8.0) & (lum < 180.0)
         if bg_level >= 35.0:
@@ -1538,7 +1572,10 @@ def _paint_chat_dates(
         out[ink] = np.repeat(date_mapped[ink, None], 3, axis=1)
 
 
-def _convert_wallpaper_chat_rgb(rgb_u8: np.ndarray) -> np.ndarray:
+def _convert_wallpaper_chat_rgb(
+    rgb_u8: np.ndarray,
+    detections: list[Detection] | None = None,
+) -> np.ndarray:
     """Convert an elevated-gray chat page whose canvas contains wallpaper."""
     rgb = rgb_u8.astype(np.float32)
     h, w = rgb.shape[:2]
@@ -1721,7 +1758,7 @@ def _convert_wallpaper_chat_rgb(rgb_u8: np.ndarray) -> np.ndarray:
 
     protect = cards | avatar | green | icon_mask
     paint_header_chrome(out, lum, chroma, protect, bg_level)
-    _paint_chat_dates(out, lum, chroma, protect, bg_level)
+    _paint_chat_dates(out, lum, chroma, protect, bg_level, detections)
 
     # Sender labels sit outside the message card but inside the avatar row.
     sender = np.zeros((h, w), dtype=bool)
@@ -1769,7 +1806,7 @@ def _convert_legacy_dark_chat_rgb(
     chroma = rgb.max(2) - rgb.min(2)
     bg_level = estimate_bg_level(lum)
     if bg_level >= 35.0:
-        return _convert_wallpaper_chat_rgb(rgb_u8)
+        return _convert_wallpaper_chat_rgb(rgb_u8, detections)
     bg_tol = 10.0
 
     hard, soft, green, avatar, tables, gray_ui = build_protect(rgb_u8, lum, chroma, bg_level)
@@ -1901,7 +1938,14 @@ def _convert_chat_rgb(
 
     # Dates are gray text on the dark canvas. Wipe their complete centered
     # row, then map all antialiased strokes without leaving a dark-theme halo.
-    _paint_chat_dates(out, lum, chroma, avatar | media | green | bubbles, estimate_bg_level(lum))
+    _paint_chat_dates(
+        out,
+        lum,
+        chroma,
+        avatar | media | green | bubbles,
+        estimate_bg_level(lum),
+        detections,
+    )
 
     # Restore outgoing bubbles, image messages, colored file icons and the
     # complete avatar tiles after all neutral-background operations finish.
