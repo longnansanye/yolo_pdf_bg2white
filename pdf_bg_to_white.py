@@ -33,6 +33,7 @@ CHAT_BUBBLE_CLASSES = frozenset({"chat_bubble_left", "chat_bubble_right"})
 CHAT_VOICE_CLASSES = frozenset({"chat_voice_left", "chat_voice_right"})
 CHAT_TIMESTAMP_CLASSES = frozenset({"chat_timestamp"})
 CHAT_NAME_CLASSES = frozenset({"chat_name"})
+CHAT_MEDIA_RECHECK_CONFIDENCE = 0.90
 # Only image messages are eligible for byte-for-byte preservation. Voice
 # detections go through the neutral-bubble recolor path after visual recheck.
 CHAT_MEDIA_CLASSES = frozenset(
@@ -248,6 +249,7 @@ def _detection_mask(
     detections: list[Detection] | None,
     class_names: frozenset[str],
     padding: int = 0,
+    max_confidence: float | None = None,
 ) -> np.ndarray:
     mask = np.zeros(shape, dtype=bool)
     if not detections:
@@ -255,6 +257,8 @@ def _detection_mask(
     height, width = shape
     for detection in detections:
         if detection.name not in class_names:
+            continue
+        if max_confidence is not None and detection.confidence >= max_confidence:
             continue
         x0, y0, x1, y1 = detection.box
         left = max(0, math.floor(x0) - padding)
@@ -1915,7 +1919,17 @@ def _convert_chat_rgb(
     avatar, _avatar_boxes = _find_chat_avatars(rgb_u8)
     green = _find_chat_green_bubbles(rgb_u8)
     bubbles = _find_chat_bubbles(rgb_u8, avatar, green, detections)
-    media = _find_chat_media(rgb_u8, avatar, bubbles, green)
+    # A low-confidence bubble can actually be a bright image. Let the visual
+    # media pass inspect those boxes before the generic bubble mask hides them.
+    low_conf_bubbles = _detection_mask(
+        rgb_u8.shape[:2],
+        detections,
+        CHAT_BUBBLE_CLASSES,
+        padding=2,
+        max_confidence=CHAT_MEDIA_RECHECK_CONFIDENCE,
+    )
+    media_bubbles = bubbles & ~low_conf_bubbles
+    media = _find_chat_media(rgb_u8, avatar, media_bubbles, green)
     media |= _detection_mask(rgb_u8.shape[:2], detections, CHAT_MEDIA_CLASSES, padding=2)
     text = _find_chat_text(rgb_u8, footer_start, avatar, bubbles, green, media)
     mapped = _map_dark_theme_ink(lum)
